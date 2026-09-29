@@ -41,9 +41,12 @@ island you stood on.
   - Distant chunks use low-detail terrain and simplified props. Nearby chunks upgrade to full detail
     with shadow-casting props, flowers and grass.
   - Unloading disposes geometry, returns typed arrays to a pool and releases instance blocks.
-- **Islands.** Each island top is a polar heightfield with a soft edge falloff, strata bands on the
-  sides, and a jagged underside cone with hanging roots.
-  - Ground collision looks up the *same triangles* the mesh is built from; there are no raycasts.
+- **Islands.** Each island top is a heightfield with a soft edge falloff, strata bands on the sides,
+  and a jagged underside cone with hanging roots.
+  - The top is built from jittered concentric rings whose vertex counts grow with radius, stitched
+    together by angle. Triangles stay close to equilateral, with no fan of slivers at the centre.
+  - Ground collision looks up the *same triangles* the mesh is built from, through a small per-island
+    grid; there are no raycasts.
   - Island spacing is resolved against neighbouring chunks by priority, so chunk borders are seamless.
 - **Biomes** follow altitude. Low islands are lush meadow, forest and blossom. The middle band holds
   autumn woods, ruins and mesa. The highest islands are snow, alpine and ice. A second noise varies
@@ -61,7 +64,9 @@ island you stood on.
 - **Rendering.**
   - One merged, flat-shaded, vertex-coloured mesh per chunk. Every prop type is a pair of shared
     `InstancedMesh`es. There is one directional light plus a hemisphere light.
-  - The shadow map is tight, follows the traveller and is skipped on Low; a blob shadow is always on.
+  - The shadow map is tight, follows the traveller in whole-texel steps and is skipped on Low; a blob
+    shadow is always on. It is sampled with a smooth bilinear PCF filter (replacing three's blocky
+    one) and fades out towards the frustum edge.
   - Fog is computed per pixel from the same function as the sky gradient, using radial distance, so
     islands dissolve exactly into the sky behind them. The far plane sits just past the fog.
   - Lit beacon beams and distant landmarks are drawn toward the camera in the vertex shader, so they

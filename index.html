@@ -375,8 +375,8 @@ initNoise(SEED);
 // ---------------------------------------------------------------------
 const QUALITY = {
   low:    { key: 'low',    label: 'Low',    dpr: 1.0,  view: 470, shadows: 0,    small: 0.45, wisps: false, puffs: 22, updraft: 0.55 },
-  medium: { key: 'medium', label: 'Medium', dpr: 1.25, view: 640, shadows: 1024, small: 0.8,  wisps: true,  puffs: 38, updraft: 0.8 },
-  high:   { key: 'high',   label: 'High',   dpr: 1.5,  view: 820, shadows: 2048, small: 1.0,  wisps: true,  puffs: 54, updraft: 1.0 },
+  medium: { key: 'medium', label: 'Medium', dpr: 1.25, view: 640, shadows: 2048, shadowExt: 30, small: 0.8,  wisps: true,  puffs: 38, updraft: 0.8 },
+  high:   { key: 'high',   label: 'High',   dpr: 1.5,  view: 820, shadows: 3072, shadowExt: 36, small: 1.0,  wisps: true,  puffs: 54, updraft: 1.0 },
 };
 const DPR = window.devicePixelRatio || 1;
 
@@ -476,6 +476,36 @@ gl_FragColor.rgb *= 1.0 - fogFactor;
 gl_FragColor.rgb = mix(gl_FragColor.rgb, skyColor(vFogDir / max(fogDist, 0.001)), fogFactor);
 #endif
 #endif`;
+
+// Smoother shadows. three r169 packs shadow depth into RGBA with nearest sampling, so its PCF taps
+// are hard 0/1 steps and edges look blocky. This filter weights a 4x4 block of depth comparisons
+// bilinearly (a 3x3-texel box of bilinear PCF), giving continuous, stable penumbrae, and fades
+// the shadow out towards the edges of the (player-following) shadow frustum.
+{
+  const src = THREE.ShaderChunk.shadowmap_pars_fragment;
+  const a = src.indexOf('float getShadow('), b = src.indexOf('vec2 cubeToUV(');
+  THREE.ShaderChunk.shadowmap_pars_fragment = src.slice(0, a) + /* glsl */`float getShadow( sampler2D shadowMap, vec2 shadowMapSize, float shadowIntensity, float shadowBias, float shadowRadius, vec4 shadowCoord ) {
+		shadowCoord.xyz /= shadowCoord.w;
+		shadowCoord.z += shadowBias;
+		vec2 edge = min( shadowCoord.xy, 1.0 - shadowCoord.xy );
+		float fade = smoothstep( 0.0, 0.14, min( edge.x, edge.y ) ) * step( shadowCoord.z, 1.0 );
+		if ( fade <= 0.0 ) return 1.0;
+		vec2 ts = 1.0 / shadowMapSize;
+		vec2 p = shadowCoord.xy * shadowMapSize - 0.5;
+		vec2 f = fract( p );
+		vec2 base = ( floor( p ) + 0.5 ) * ts;
+		float sum = 0.0;
+		for ( int j = -1; j <= 2; j ++ ) {
+			float wy = j == -1 ? 1.0 - f.y : ( j == 2 ? f.y : 1.0 );
+			for ( int i = -1; i <= 2; i ++ ) {
+				float wx = i == -1 ? 1.0 - f.x : ( i == 2 ? f.x : 1.0 );
+				sum += wx * wy * step( shadowCoord.z, unpackRGBAToDepth( texture2D( shadowMap, base + vec2( float( i ), float( j ) ) * ts ) ) );
+			}
+		}
+		return mix( 1.0, sum / 9.0, shadowIntensity * fade );
+	}
+	` + src.slice(b);
+}
 
 function addSkyUniforms(u) {
   u.uZenith = U.uZenith; u.uHorizon = U.uHorizon; u.uSunGlow = U.uSunGlow; u.uSunDir = U.uSunDir; u.uGlowAmt = U.uGlowAmt;
@@ -750,10 +780,10 @@ let puffs;
 // Lights
 // ---------------------------------------------------------------------
 const sunLight = new THREE.DirectionalLight(0xffffff, 2.4);
-sunLight.shadow.camera.left = -42; sunLight.shadow.camera.right = 42;
-sunLight.shadow.camera.top = 42; sunLight.shadow.camera.bottom = -42;
-sunLight.shadow.camera.near = 1; sunLight.shadow.camera.far = 420;
-sunLight.shadow.bias = -0.0006; sunLight.shadow.normalBias = 0.35;
+sunLight.shadow.camera.near = 20; sunLight.shadow.camera.far = 300;
+sunLight.shadow.bias = -0.0004; sunLight.shadow.normalBias = 0.12;
+sunLight.shadow.intensity = 0.88;
+let shadowExt = 30;
 scene.add(sunLight, sunLight.target);
 const hemiLight = new THREE.HemisphereLight(0xbcd4f0, 0x6a6470, 1.25);
 scene.add(hemiLight);
@@ -1384,9 +1414,10 @@ function trimCaches(pcx, pcz) {
   trim(candCache, 900); trim(survCache, 700); trim(layoutCache, 500);
 }
 
-// --- Island data: polar heightfield ------------------------------------------------
-// Vertex 0 is the centre; ring i (1..nRing) segment j is vertex 1+(i-1)*nSeg+j and lies on the
-// ray at angle j/nSeg*TAU. The mesh and the collision lookup share these arrays exactly.
+// --- Island data: ring-based heightfield ---------------------------------------------------
+// Vertex 0 is the centre, then concentric rings out to the rim ring (nSeg vertices, used by the
+// strata). Ring vertex counts grow with radius so triangles stay near-equilateral. The top
+// triangle list (isl.tris) is shared by the mesh and the collision lookup, so they always agree.
 const F_PLAZA = 1, F_WATER = 2, F_PAVED = 4;
 function topShape(bio, sk, x, z, u) {
   let n = fbm(nTerrain, x * bio.freq, z * bio.freq, 3);
@@ -1407,34 +1438,54 @@ function buildIsland(p) {
     p, id: p.id, x: p.x, z: p.z, y: p.y, R, cls: p.cls, biome: p.biome, bio, uid: p.uid,
     colliders: [], tori: [], beacon: null, water: null, cand: c,
   };
-  let nSeg = Math.round(10 + R * 1.3), nRing = Math.round(2 + R / 3.1);
-  if (p.cls === CLS_LANDMARK) { nSeg = 64; nRing = 15; }
-  if (p.cls === CLS_CANOPY) { nSeg = 52; nRing = 10; }
-  nSeg = clamp(Math.ceil(nSeg / 4) * 4, 12, 64); nRing = clamp(nRing, 3, 15);
-  isl.nSeg = nSeg; isl.nRing = nRing;
-  const nV = 1 + nRing * nSeg;
-  const vx = new Float32Array(nV), vz = new Float32Array(nV), vh = new Float32Array(nV), vu = new Float32Array(nV);
-  const flags = new Uint8Array(nV), shade = new Float32Array(nV), rim = new Float32Array(nSeg);
-  const cs = new Float32Array(nSeg), sn = new Float32Array(nSeg);
-  let maxRim = 0;
+  let nSeg = Math.round(10 + R * 1.3);
+  if (p.cls === CLS_LANDMARK) nSeg = 64;
+  if (p.cls === CLS_CANOPY) nSeg = 52;
+  nSeg = clamp(Math.ceil(nSeg / 4) * 4, 12, 64);
+  const rim = new Float32Array(nSeg), cs = new Float32Array(nSeg), sn = new Float32Array(nSeg);
+  let maxRim = 0, sumRim = 0;
   for (let j = 0; j < nSeg; j++) {
     const a = j / nSeg * TAU;
     cs[j] = Math.cos(a); sn[j] = Math.sin(a);
     rim[j] = rimFactor(c, a) * R;
     if (rim[j] > maxRim) maxRim = rim[j];
+    sumRim += rim[j];
   }
-  vx[0] = p.x; vz[0] = p.z; vu[0] = 0;
-  for (let i = 1; i <= nRing; i++) {
-    for (let j = 0; j < nSeg; j++) {
-      const k = 1 + (i - 1) * nSeg + j;
-      const u = i === nRing ? 1 : (i + (r() - 0.5) * 0.34) / nRing;
-      vu[k] = u; vx[k] = p.x + cs[j] * rim[j] * u; vz[k] = p.z + sn[j] * rim[j] * u;
+  // Concentric rings from the rim inward. Each ring gets as many vertices as keeps its triangles
+  // close to equilateral (edge ~ the rim spacing), so there is no many-sliver fan at the centre.
+  // Interior vertices are jittered; everything stays on the same shared triangle list.
+  const avgRim = sumRim / nSeg, Lt = TAU * avgRim / nSeg, step = Lt * 0.88 / avgRim;
+  const ringU = [1], ringS = [nSeg];
+  for (let u = 1 - step; u * avgRim > Lt * 0.62; u -= step) { ringU.push(u); ringS.push(Math.max(5, Math.round(TAU * u * avgRim / Lt))); }
+  ringU.reverse(); ringS.reverse();
+  const nRing = ringU.length, ringStart = new Int32Array(nRing);
+  let nV = 1;
+  for (let i = 0; i < nRing; i++) { ringStart[i] = nV; nV += ringS[i]; }
+  const vx = new Float32Array(nV), vz = new Float32Array(nV), vh = new Float32Array(nV), vu = new Float32Array(nV), va = new Float32Array(nV);
+  const flags = new Uint8Array(nV), shade = new Float32Array(nV);
+  vx[0] = p.x + (r() - 0.5) * 0.3 * Lt; vz[0] = p.z + (r() - 0.5) * 0.3 * Lt;
+  for (let i = 0; i < nRing; i++) {
+    const S = ringS[i], s0 = ringStart[i], isRim = i === nRing - 1, rot = isRim ? 0 : r();
+    for (let j = 0; j < S; j++) {
+      const k = s0 + j;
+      const a = isRim ? j / S * TAU : (j + rot + (r() - 0.5) * 0.4) / S * TAU;
+      const u = isRim ? 1 : clamp(ringU[i] + (r() - 0.5) * 0.4 * step, 0.02, 0.985);
+      const rr = (isRim ? rim[j] : rimFactor(c, a) * R) * u;
+      va[k] = a; vu[k] = u; vx[k] = p.x + Math.cos(a) * rr; vz[k] = p.z + Math.sin(a) * rr;
     }
   }
   const sk = p.cls === CLS_CANOPY ? 1 : clamp(R / 22, 0.28, 1.5);
   isl.sk = sk;
   for (let k = 0; k < nV; k++) vh[k] = p.y + topShape(bio, sk, vx[k], vz[k], vu[k]);
-  Object.assign(isl, { vx, vz, vh, vu, flags, shade, rim, cs, sn, maxR2: (maxRim + 0.5) * (maxRim + 0.5), maxRim });
+  Object.assign(isl, { nSeg, nRing, ringStart, ringS, rimStart: ringStart[nRing - 1], Lt, vx, vz, vh, vu, va, flags, shade, rim, cs, sn,
+    maxR2: (maxRim + 0.5) * (maxRim + 0.5), maxRim });
+  // Full-detail top triangulation, shared by the rendered mesh and the ground-height lookup.
+  const T = [];
+  const ring0 = ringIndices(isl, 0, 1);
+  for (let k = 0; k < ring0.length; k++) T.push(0, ring0[k], ring0[(k + 1) % ring0.length]);
+  for (let i = 0; i + 1 < nRing; i++) stitchRings(T, ringIndices(isl, i, 1), ringIndices(isl, i + 1, 1), va);
+  isl.tris = nV < 65536 ? new Uint16Array(T) : new Uint32Array(T);
+  buildTriGrid(isl);
 
   // Beacon plaza: flatten a small disc and pave it.
   let beaconAng = r() * TAU;
@@ -1463,16 +1514,16 @@ function buildIsland(p) {
     const su = 0.46, ca = Math.cos((jw + 0.5) / nSeg * TAU), sa = Math.sin((jw + 0.5) / nSeg * TAU);
     const rs = (rim[jw] + rim[jw2]) / 2;
     const sx = p.x + ca * rs * su, sz = p.z + sa * rs * su;
-    const rimK = 1 + (nRing - 1) * nSeg + jw, rimK2 = 1 + (nRing - 1) * nSeg + jw2;
-    const poolR = 2.2 + 1.2 * sk;
-    for (let k = 1; k < nV; k++) {
-      const j = (k - 1) % nSeg;
+    const rimK = isl.rimStart + jw, rimK2 = isl.rimStart + jw2;
+    const ex = (vx[rimK] + vx[rimK2]) / 2, ez = (vz[rimK] + vz[rimK2]) / 2;
+    const poolR = 2.2 + 1.2 * sk, halfW = 0.9 + 0.5 * sk;
+    for (let k = 0; k < nV; k++) {
       const dPool = Math.hypot(vx[k] - sx, vz[k] - sz);
       if (dPool < poolR) { vh[k] -= 0.4 * smoothstep(poolR, 0.5, dPool); flags[k] |= F_WATER; }
-      else if ((j === jw || j === jw2) && vu[k] > su - 0.05) { vh[k] -= 0.3; flags[k] |= F_WATER; }
+      else if (segDist2(vx[k], vz[k], sx, sz, ex, ez) < (halfW + Lt * 0.35) ** 2) { vh[k] -= 0.3; flags[k] |= F_WATER; }
     }
-    isl.water = { jw, sx, sz, ex: (vx[rimK] + vx[rimK2]) / 2, ez: (vz[rimK] + vz[rimK2]) / 2, ey: Math.min(vh[rimK], vh[rimK2]) - 0.1, dirx: ca, dirz: sa,
-      halfW: Math.hypot(vx[rimK] - vx[rimK2], vz[rimK] - vz[rimK2]) / 2 };
+    vh[rimK] -= 0.2; vh[rimK2] -= 0.2;
+    isl.water = { jw, sx, sz, ex, ez, ey: Math.min(vh[rimK], vh[rimK2]) - 0.1, dirx: ca, dirz: sa, poolR, halfW };
   }
   let tmin = Infinity, tmax = -Infinity;
   for (let k = 0; k < nV; k++) { if (vh[k] < tmin) tmin = vh[k]; if (vh[k] > tmax) tmax = vh[k]; }
@@ -1501,44 +1552,74 @@ function buildIsland(p) {
   return isl;
 }
 
-// Exact ground height on island `isl` at (x, z), or NaN when outside its top surface.
-// Uses the same triangles (and diagonal) as the rendered mesh. Sets LU = radial fraction.
-let LU = 0;
-function bary(isl, i0, i1, i2, x, z) {
-  const VX = isl.vx, VZ = isl.vz, VH = isl.vh;
-  const x0 = VX[i0], z0 = VZ[i0], x1 = VX[i1], z1 = VZ[i1], x2 = VX[i2], z2 = VZ[i2];
-  const det = (z1 - z2) * (x0 - x2) + (x2 - x1) * (z0 - z2);
-  if (det > -1e-9 && det < 1e-9) return VH[i0];
-  const l0 = ((z1 - z2) * (x - x2) + (x2 - x1) * (z - z2)) / det;
-  const l1 = ((z2 - z0) * (x - x2) + (x0 - x2) * (z - z2)) / det;
-  return l0 * VH[i0] + l1 * VH[i1] + (1 - l0 - l1) * VH[i2];
+// Vertex indices of ring i in angular order (stride 2 skips every other vertex for the far mesh).
+function ringIndices(isl, i, stride) {
+  const s0 = isl.ringStart[i], S = isl.ringS[i], out = [];
+  for (let j = 0; j < S; j += stride) out.push(s0 + j);
+  return out;
 }
+// Stitch two concentric rings (ascending angle order) into a band of triangles by always advancing
+// whichever ring's next vertex comes first around the circle. Works for any vertex counts.
+function stitchRings(out, A, B, ang) {
+  const nA = A.length, nB = B.length, a0 = ang[A[0]];
+  let b0 = 0, bd = Infinity;
+  for (let k = 0; k < nB; k++) { const d = Math.abs(wrapAngle(ang[B[k]] - a0)); if (d < bd) { bd = d; b0 = k; } }
+  const bStart = a0 + wrapAngle(ang[B[b0]] - a0), bRef = ang[B[b0]];
+  const ua = (k) => (k >= nA ? a0 + TAU : a0 + (((ang[A[k]] - a0) % TAU) + TAU) % TAU);
+  const ub = (k) => (k >= nB ? bStart + TAU : bStart + (((ang[B[(b0 + k) % nB]] - bRef) % TAU) + TAU) % TAU);
+  let i = 0, o = 0;
+  while (i < nA || o < nB) {
+    const na = i < nA ? ua(i + 1) : Infinity, nb = o < nB ? ub(o + 1) : Infinity;
+    if (na < nb) { out.push(A[i % nA], A[(i + 1) % nA], B[(b0 + o) % nB]); i++; }
+    else { out.push(A[i % nA], B[(b0 + o + 1) % nB], B[(b0 + o) % nB]); o++; }
+  }
+}
+// Uniform grid over the island listing the triangles touching each cell (compact CSR arrays).
+function buildTriGrid(isl) {
+  const T = isl.tris, nT = T.length / 3, VX = isl.vx, VZ = isl.vz;
+  const cell = Math.max(1.5, isl.Lt), inv = 1 / cell;
+  const x0 = isl.x - isl.maxRim - 1, z0 = isl.z - isl.maxRim - 1;
+  const W = Math.ceil((2 * isl.maxRim + 2) * inv) + 1;
+  const start = new Uint32Array(W * W + 1);
+  const span = (t, fn) => {
+    const a = T[t * 3], b = T[t * 3 + 1], c = T[t * 3 + 2];
+    const gx0 = Math.max(0, Math.floor((Math.min(VX[a], VX[b], VX[c]) - x0) * inv)), gx1 = Math.min(W - 1, Math.floor((Math.max(VX[a], VX[b], VX[c]) - x0) * inv));
+    const gz0 = Math.max(0, Math.floor((Math.min(VZ[a], VZ[b], VZ[c]) - z0) * inv)), gz1 = Math.min(W - 1, Math.floor((Math.max(VZ[a], VZ[b], VZ[c]) - z0) * inv));
+    for (let gz = gz0; gz <= gz1; gz++) for (let gx = gx0; gx <= gx1; gx++) fn(gz * W + gx);
+  };
+  for (let t = 0; t < nT; t++) span(t, (c) => { start[c + 1]++; });
+  for (let c = 0; c < W * W; c++) start[c + 1] += start[c];
+  const fill = start.slice(0, W * W), list = nT < 65536 ? new Uint16Array(start[W * W]) : new Uint32Array(start[W * W]);
+  for (let t = 0; t < nT; t++) span(t, (c) => { list[fill[c]++] = t; });
+  isl.gx0 = x0; isl.gz0 = z0; isl.gW = W; isl.gInv = inv; isl.cellStart = start; isl.cellTris = list;
+}
+// Exact ground height on island `isl` at (x, z), or NaN when outside its top surface.
+// Interpolates the very triangles the mesh is drawn with. Sets LU = radial fraction of the rim.
+let LU = 0;
 function islandHeight(isl, x, z) {
   const dx = x - isl.x, dz = z - isl.z, d2 = dx * dx + dz * dz;
   if (d2 > isl.maxR2) return NaN;
-  const nSeg = isl.nSeg, nRing = isl.nRing, VX = isl.vx, VZ = isl.vz;
+  const nSeg = isl.nSeg;
   let t = Math.atan2(dz, dx);
   if (t < 0) t += TAU;
   const fj = t / TAU * nSeg;
   let j = Math.floor(fj);
   if (j >= nSeg) j = nSeg - 1;
   const j1 = j + 1 === nSeg ? 0 : j + 1;
-  const rimI = isl.rim[j] + (isl.rim[j1] - isl.rim[j]) * (fj - j);
-  LU = Math.sqrt(d2) / rimI;
-  const cx = isl.x, cz = isl.z;
-  for (let i = 1; i <= nRing; i++) {
-    const a = 1 + (i - 1) * nSeg + j, b = 1 + (i - 1) * nSeg + j1;
-    const ex = VX[b] - VX[a], ez = VZ[b] - VZ[a];
-    const sp = ex * (z - VZ[a]) - ez * (x - VX[a]);
-    const sc = ex * (cz - VZ[a]) - ez * (cx - VX[a]);
-    if (sp * sc >= 0) {
-      if (i === 1) return bary(isl, 0, b, a, x, z);
-      const ia = a - nSeg, ib = b - nSeg;
-      const qx = VX[b] - VX[ia], qz = VZ[b] - VZ[ia];
-      const sP = qx * (z - VZ[ia]) - qz * (x - VX[ia]);
-      const sB = qx * (VZ[ib] - VZ[ia]) - qz * (VX[ib] - VX[ia]);
-      return sP * sB >= 0 ? bary(isl, ia, ib, b, x, z) : bary(isl, ia, b, a, x, z);
-    }
+  LU = Math.sqrt(d2) / (isl.rim[j] + (isl.rim[j1] - isl.rim[j]) * (fj - j));
+  const W = isl.gW, gx = ((x - isl.gx0) * isl.gInv) | 0, gz = ((z - isl.gz0) * isl.gInv) | 0;
+  if (gx < 0 || gz < 0 || gx >= W || gz >= W) return NaN;
+  const c = gz * W + gx, CS = isl.cellStart, CT = isl.cellTris, T = isl.tris, VX = isl.vx, VZ = isl.vz, VH = isl.vh;
+  for (let k = CS[c], e = CS[c + 1]; k < e; k++) {
+    const t3 = CT[k] * 3, i0 = T[t3], i1 = T[t3 + 1], i2 = T[t3 + 2];
+    const x0 = VX[i0], z0 = VZ[i0], x1 = VX[i1], z1 = VZ[i1], x2 = VX[i2], z2 = VZ[i2];
+    const det = (z1 - z2) * (x0 - x2) + (x2 - x1) * (z0 - z2);
+    if (det === 0) continue;
+    const l0 = ((z1 - z2) * (x - x2) + (x2 - x1) * (z - z2)) / det;
+    if (l0 < -1e-5) continue;
+    const l1 = ((z2 - z0) * (x - x2) + (x0 - x2) * (z - z2)) / det;
+    if (l1 < -1e-5 || l0 + l1 > 1 + 1e-5) continue;
+    return l0 * VH[i0] + l1 * VH[i1] + (1 - l0 - l1) * VH[i2];
   }
   return NaN;
 }
@@ -1645,10 +1726,14 @@ function topFaceColor(isl, a, b, c, ny) {
   const H = (isl.vh[a] + isl.vh[b] + isl.vh[c]) / 3 - isl.y;
   const u = (isl.vu[a] + isl.vu[b] + isl.vu[c]) / 3;
   const jit = fhash(isl.uid, a, b, c);
-  const water = ((F[a] & F_WATER) ? 1 : 0) + ((F[b] & F_WATER) ? 1 : 0) + ((F[c] & F_WATER) ? 1 : 0);
-  const plaza = ((F[a] & F_PLAZA) ? 1 : 0) + ((F[b] & F_PLAZA) ? 1 : 0) + ((F[c] & F_PLAZA) ? 1 : 0);
-  if (water === 3) { mix3(_col, WATER_A, WATER_B, jit); return _col; }
-  if (plaza >= 2) { mix3(_col, PLAZA_A, PLAZA_B, jit > 0.5 ? 1 : 0); return _col; }
+  const w = isl.water, bc = isl.beacon;
+  if (w) {
+    const dp = Math.hypot(X - w.sx, Z - w.sz);
+    const wet = ((F[a] & F_WATER) ? 1 : 0) + ((F[b] & F_WATER) ? 1 : 0) + ((F[c] & F_WATER) ? 1 : 0);
+    const reach = Math.max(w.halfW, isl.Lt * 0.62);
+    if (dp < w.poolR * 0.8 || (wet >= 2 && segDist2(X, Z, w.sx, w.sz, w.ex, w.ez) < reach * reach)) { mix3(_col, WATER_A, WATER_B, jit); return _col; }
+  }
+  if (bc && Math.hypot(X - bc.x, Z - bc.z) < 3.3) { mix3(_col, PLAZA_A, PLAZA_B, jit > 0.5 ? 1 : 0); return _col; }
   const n1 = nDetail(X * 0.07, Z * 0.07) * 0.5 + 0.5;
   mix3(_col, bio.top[0], bio.top[1], smoothstep(0.3, 0.7, n1));
   if (isl.biome === B_ALPINE) mix3(_col, _col, bio.top[2], smoothstep(2.2, 5, H) * 0.95);
@@ -1676,35 +1761,35 @@ const RB = []; // reusable ring buffers (max 64 segments) for strata / underside
 for (let i = 0; i < 12; i++) RB.push(new Float32Array(64));
 function buildIslandMesh(isl, B, step) { for (const _ of buildIslandMeshGen(isl, B, step)); }
 function* buildIslandMeshGen(isl, B, step) {
-  const nSeg = isl.nSeg, nRing = isl.nRing, vi = (i, j) => 1 + (i - 1) * nSeg + j;
-  const big = step === 1 && nSeg * nRing > 360;
-  const rings = [];
-  for (let i = step; i < nRing; i += step) rings.push(i);
-  rings.push(nRing);
+  const nSeg = isl.nSeg, nRing = isl.nRing, rs0 = isl.rimStart, vi = (j) => rs0 + j;
+  const big = step === 1 && isl.tris.length > 1800;
   const segs = [];
   for (let j = 0; j < nSeg; j += step) segs.push(j);
   const S = segs.length;
-  // Top surface (same diagonal as islandHeight).
-  for (let s = 0; s < S; s++) topFace(isl, B, 0, vi(rings[0], segs[(s + 1) % S]), vi(rings[0], segs[s]));
-  for (let k = 0; k + 1 < rings.length; k++) {
-    const ia = rings[k], ib = rings[k + 1];
-    for (let s = 0; s < S; s++) {
-      const j = segs[s], j2 = segs[(s + 1) % S];
-      const a = vi(ia, j), b = vi(ia, j2), c = vi(ib, j2), d = vi(ib, j);
-      topFace(isl, B, a, b, c); topFace(isl, B, a, c, d);
-    }
+  // Top surface: the shared full-detail triangulation, or a sparser stitch of every other ring.
+  let T = isl.tris;
+  if (step !== 1) {
+    T = [];
+    const keep = [];
+    for (let i = nRing - 1; i >= 0; i -= 2) keep.push(i);
+    keep.reverse();
+    const idx = (i) => ringIndices(isl, i, i === nRing - 1 || isl.ringS[i] >= 10 ? 2 : 1);
+    let prev = idx(keep[0]);
+    for (let k = 0; k < prev.length; k++) T.push(0, prev[k], prev[(k + 1) % prev.length]);
+    for (let q = 1; q < keep.length; q++) { const cur = idx(keep[q]); stitchRings(T, prev, cur, isl.va); prev = cur; }
   }
+  for (let t = 0; t < T.length; t += 3) topFace(isl, B, T[t], T[t + 1], T[t + 2]);
   if (big) yield;
   // Strata bands.
   const bio = isl.bio, cx = isl.x, cz = isl.z, cy = isl.y, hs = isl.uid;
   let px = RB[0], pz = RB[1], py = RB[2], qx = RB[3], qz = RB[4], qy = RB[5];
-  for (let s = 0; s < S; s++) { const k = vi(nRing, segs[s]); px[s] = isl.vx[k]; pz[s] = isl.vz[k]; py[s] = isl.vh[k]; }
+  for (let s = 0; s < S; s++) { const k = vi(segs[s]); px[s] = isl.vx[k]; pz[s] = isl.vz[k]; py[s] = isl.vh[k]; }
   const bands = step === 1 ? [0, 1, 2, 3] : [1, 3];
   let bandIdx = 0;
   for (const bk of bands) {
     const rho = isl.srho[bk], dep = isl.sdep[bk];
     for (let s = 0; s < S; s++) {
-      const k = vi(nRing, segs[s]);
+      const k = vi(segs[s]);
       const jr = 1 + (fhash(hs, 7, bk, segs[s]) - 0.5) * 0.07;
       qx[s] = cx + (isl.vx[k] - cx) * rho * jr; qz[s] = cz + (isl.vz[k] - cz) * rho * jr;
       qy[s] = cy - dep * (0.9 + 0.2 * fhash(hs, 9, bk, segs[s]));
@@ -1732,7 +1817,7 @@ function* buildIslandMeshGen(isl, B, step) {
     const rho = rK * (leafy ? Math.sqrt(1 - t * t) : Math.pow(1 - t, 0.85));
     const dep = dK + coneD * (leafy ? t : Math.pow(t, 1.2));
     for (let s = 0; s < U; s++) {
-      const k = vi(nRing, segs[s * 2]);
+      const k = vi(segs[s * 2]);
       const jr = 1 + (fhash(hs, 21, m, s) - 0.5) * (leafy ? 0.2 : 0.45);
       const ex = cx + isl.tipX * t, ez = cz + isl.tipZ * t;
       outX[s] = ex + (isl.vx[k] - cx) * rho * jr; outZ[s] = ez + (isl.vz[k] - cz) * rho * jr;
@@ -3442,11 +3527,11 @@ function updateSunFollow() {
   const P = player, L = lightDir;
   _lr.set(0, 1, 0).cross(L); if (_lr.lengthSq() < 1e-6) _lr.set(1, 0, 0); _lr.normalize();
   _lu.copy(L).cross(_lr).normalize();
-  const texel = 84 / Math.max(512, sunLight.shadow.mapSize.x);
+  const texel = 2 * shadowExt / Math.max(512, sunLight.shadow.mapSize.x);
   const a = P.pos.x * _lr.x + P.pos.y * _lr.y + P.pos.z * _lr.z, b = P.pos.x * _lu.x + P.pos.y * _lu.y + P.pos.z * _lu.z;
   const da = Math.round(a / texel) * texel - a, db = Math.round(b / texel) * texel - b;
   sunLight.target.position.set(P.pos.x + _lr.x * da + _lu.x * db, P.pos.y + _lr.y * da + _lu.y * db, P.pos.z + _lr.z * da + _lu.z * db);
-  sunLight.position.copy(sunLight.target.position).addScaledVector(L, 200);
+  sunLight.position.copy(sunLight.target.position).addScaledVector(L, 150);
   sunLight.target.updateMatrixWorld();
 }
 
@@ -3505,11 +3590,16 @@ function setViewDistance(v) {
   cloudSea.scale.set(v * 2.3, 1, v * 2.3); wisps.scale.set(v * 2.3, 1, v * 2.3);
   U.uPuffBox.value = v * 2.1;
 }
-function setShadows(size) {
+function setShadows(size, ext) {
   const on = size > 0;
   if (on && sunLight.shadow.mapSize.x !== size) {
     sunLight.shadow.mapSize.set(size, size);
     if (sunLight.shadow.map) { sunLight.shadow.map.dispose(); sunLight.shadow.map = null; }
+  }
+  if (ext && ext !== shadowExt || sunLight.shadow.camera.right !== shadowExt) {
+    shadowExt = ext || shadowExt;
+    const c = sunLight.shadow.camera;
+    c.left = c.bottom = -shadowExt; c.right = c.top = shadowExt; c.updateProjectionMatrix();
   }
   if (renderer.shadowMap.enabled !== on) { renderer.shadowMap.enabled = on; sunLight.castShadow = on; }
 }
@@ -3529,7 +3619,7 @@ function applyQuality() {
   const q = currentQ(), auto = settings.quality === 'auto';
   setPixelRatio(Math.min(DPR, q.dpr === 1.25 && auto ? 1.5 : q.dpr) * (auto ? autoQ.scale : 1));
   setViewDistance(auto ? autoQ.view : q.view);
-  setShadows(auto ? (autoQ.shadows ? 1024 : 0) : q.shadows);
+  setShadows(auto ? (autoQ.shadows ? 2048 : 0) : q.shadows, auto ? 30 : q.shadowExt);
   if (smallDensity !== q.small) { smallDensity = q.small; refreshSmallProps(); }
   wisps.visible = q.wisps; puffs.count = q.puffs; U.uUpdraftDensity.value = q.updraft;
   document.querySelectorAll('#quality-row button').forEach((b) => b.classList.toggle('sel', b.dataset.q === settings.quality));
@@ -3857,6 +3947,58 @@ window.__cloudlight = {
   },
   newWorld, applyQuality, settings,
   UPSTAT,
+  testTerrain(nIslands = 400) {
+    // For generated islands: the top triangles must tile the rim polygon exactly (no holes or
+    // overlaps), the grid lookup must agree with a brute-force search, and triangles should be fat.
+    const res = { islands: 0, areaErrMax: 0, mismatches: 0, samples: 0, holes: 0, minAngleP5: 0, centreValenceMax: 0, trisPerIsland: 0 };
+    const angles = [];
+    let tri = 0;
+    outer: for (let cz = -4; cz <= 4; cz++) for (let cx = -4; cx <= 4; cx++) {
+      for (const p of getLayout(cx, cz).islands) {
+        if (res.islands >= nIslands) break outer;
+        const isl = buildIsland(p), T = isl.tris, X = isl.vx, Z = isl.vz, H = isl.vh;
+        res.islands++; tri += T.length / 3;
+        let area = 0, val = 0;
+        for (let t = 0; t < T.length; t += 3) {
+          const a = T[t], b = T[t + 1], c = T[t + 2];
+          area += Math.abs((X[b] - X[a]) * (Z[c] - Z[a]) - (X[c] - X[a]) * (Z[b] - Z[a])) / 2;
+          if (a === 0 || b === 0 || c === 0) val++;
+          const L = (i, j) => Math.hypot(X[i] - X[j], Z[i] - Z[j]);
+          const la = L(b, c), lb = L(a, c), lc = L(a, b);
+          const ang = (x, y, z) => Math.acos(clamp((y * y + z * z - x * x) / (2 * y * z), -1, 1)) * 180 / Math.PI;
+          angles.push(Math.min(ang(la, lb, lc), ang(lb, la, lc), ang(lc, la, lb)));
+        }
+        let poly = 0;
+        const r0 = isl.rimStart, n = isl.nSeg;
+        for (let j = 0; j < n; j++) { const a = r0 + j, b = r0 + (j + 1) % n; poly += X[a] * Z[b] - X[b] * Z[a]; }
+        poly = Math.abs(poly) / 2;
+        res.areaErrMax = Math.max(res.areaErrMax, Math.abs(area / poly - 1));
+        res.centreValenceMax = Math.max(res.centreValenceMax, val);
+        const rr = rngFrom(isl.uid);
+        for (let k = 0; k < 120; k++) {
+          const a = rr() * TAU, d = Math.sqrt(rr()) * isl.maxRim * 1.02, x = isl.x + Math.cos(a) * d, z = isl.z + Math.sin(a) * d;
+          const h = islandHeight(isl, x, z);
+          let hb = NaN;
+          for (let t = 0; t < T.length && hb !== hb; t += 3) {
+            const i0 = T[t], i1 = T[t + 1], i2 = T[t + 2];
+            const det = (Z[i1] - Z[i2]) * (X[i0] - X[i2]) + (X[i2] - X[i1]) * (Z[i0] - Z[i2]);
+            const l0 = ((Z[i1] - Z[i2]) * (x - X[i2]) + (X[i2] - X[i1]) * (z - Z[i2])) / det;
+            const l1 = ((Z[i2] - Z[i0]) * (x - X[i2]) + (X[i0] - X[i2]) * (z - Z[i2])) / det;
+            if (l0 >= -1e-5 && l1 >= -1e-5 && l0 + l1 <= 1 + 1e-5) hb = l0 * H[i0] + l1 * H[i1] + (1 - l0 - l1) * H[i2];
+          }
+          res.samples++;
+          if ((h !== h) !== (hb !== hb) || (h === h && Math.abs(h - hb) > 1e-3)) res.mismatches++;
+          if (h !== h && LU < 0.97) res.holes++;
+        }
+      }
+    }
+    angles.sort((a, b) => a - b);
+    res.minAngleP5 = +angles[Math.floor(angles.length * 0.05)].toFixed(1);
+    res.minAngleMedian = +angles[angles.length >> 1].toFixed(1);
+    res.trisPerIsland = Math.round(tri / res.islands);
+    res.areaErrMax = +res.areaErrMax.toExponential(2);
+    return res;
+  },
   testSpacing(R = 8) {
     let bad = 0, pairs = 0;
     for (let cz = -R; cz <= R; cz++) for (let cx = -R; cx <= R; cx++) {
